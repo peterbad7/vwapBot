@@ -1,0 +1,809 @@
+import MetaTrader5 as mt5
+import pandas as pd
+import numpy as np
+import time
+import requests
+import logging
+from datetime import datetime
+from sklearn.linear_model import LinearRegression
+from dash import Dash, html, dcc
+import joblib
+import threading
+import plotly.graph_objects as go
+from dash.dependencies import Input, Output
+
+
+class EliteVWAPTrader:
+    def __init__(self):
+        # Core Configuration
+        self.symbols = ["EURUSDm", "XAUUSDm", "BTCUSDm"]
+        self.timeframe = mt5.TIMEFRAME_M15
+        self.vwap_period = 20
+        self.current_symbol = None
+
+        # Enhanced Risk Management
+        self.risk_percent = 1
+        self.min_lot_size = 0.01
+        self.max_lot_size = 10.0
+        self.atr_period = 14
+        self.score_threshold = 0.5
+        self.consecutive_signals = 0
+        self.required_consecutive = 2
+        self.stop_loss_multiplier = 1.5
+        self.take_profit_multiplier = 2.0
+        self.min_deviation_pct = 0.05  # Minimum price deviation from VWAP to generate signal
+        self.min_trend_strength = 0.3  # Minimum trend strength to consider a signal
+
+        # Trading Sessions (GMT)
+        self.session_hours = {
+            "London": {"start": 7, "end": 16},
+            "NewYork": {"start": 8, "end": 17},
+            "Asia": {"start": 21, "end": 5}
+        }
+        self.trading_hours = {"start": 0, "end": 23}
+
+        # Telegram notifications
+        self.telegram_bot_token = "8279551043:AAHBHbg9BeTY2bRjUoLje-Q4uxPSVAE3R_0"
+        self.telegram_chat_id = "814231059"
+
+        # MT5 constants
+        self.ORDER_BUY = 0
+        self.ORDER_SELL = 1
+        self.TRADE_ACTION_DEAL = 1
+        self.ORDER_TIME_GTC = 0
+        self.DEVIATION = 10
+        self.MAGIC_NUMBER = 123456
+
+        # Initialize variables
+        self.last_trade_time = None
+        self.last_signal = None
+        self.ml_model = None
+        self.dash_app = None
+        self.dash_thread = None
+
+        # Setup logging
+        self.setup_logging()
+        self.load_ml_model()
+
+    def setup_logging(self):
+        """Configure advanced logging"""
+        logging.basicConfig(
+            filename='elite_vwap.log',
+            level=logging.INFO,
+            format='%(asctime)s | %(levelname)s | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
+        self.logger = logging.getLogger()
+        if not self.logger.handlers:
+            self.logger.addHandler(console_handler)
+
+    def load_ml_model(self):
+        """Load a pre-trained ML model if it exists."""
+        try:
+            self.ml_model = joblib.load('vwap_model.pkl')
+            self.logger.info("✅ ML model loaded successfully from 'vwap_model.pkl'")
+        except FileNotFoundError:
+            self.ml_model = None
+            self.logger.warning("⚠️ ML model 'vwap_model.pkl' not found. Trading will proceed without ML confirmation.")
+        except Exception as e:
+            self.ml_model = None
+            self.logger.error(f"❌ Error loading ML model: {e}")
+
+    def initialize_mt5(self):
+        """Connect to the MT5 terminal and prepare symbols."""
+        if not mt5.initialize():
+            self.logger.error(f"MT5 initialization failed, error: {mt5.last_error()}")
+            return False
+
+        account_info = mt5.account_info()
+        if account_info:
+            self.logger.info(f"✅ Successfully connected to MT5 Account #{account_info.login}")
+            print(f"\nAccount Information:")
+            print(f"Balance: ${account_info.balance:.2f}")
+            print(f"Equity: ${account_info.equity:.2f}")
+            print(f"Margin: ${account_info.margin:.2f}")
+        else:
+            self.logger.error("❌ Could not get account info. Connection may be unstable.")
+            return False
+
+        for symbol in self.symbols:
+            if mt5.symbol_select(symbol, True):
+                self.logger.info(f"   - Symbol {symbol} enabled.")
+                print(f"Enabled symbol: {symbol}")
+            else:
+                self.logger.warning(f"   - ⚠️ Failed to enable symbol {symbol}.")
+                print(f"Failed to enable symbol: {symbol}")
+
+        return True
+
+    def send_telegram_alert(self, message):
+        """Send a notification via Telegram."""
+        if not self.telegram_bot_token or not self.telegram_chat_id:
+            return
+        try:
+            url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
+            params = {"chat_id": self.telegram_chat_id, "text": message, "parse_mode": "Markdown"}
+            requests.post(url, params=params, timeout=10)
+        except Exception as e:
+            self.logger.error(f"❌ Failed to send Telegram alert: {e}")
+
+    def calculate_dynamic_vwap(self, symbol):
+        """3D VWAP with volume profile"""
+        df = self.get_ohlc_data(symbol, 500)
+        if df is None or df.empty:
+            self.logger.warning(f"No data available for {symbol} VWAP calculation")
+            return None
+        df['vp'] = df['tick_volume'] * (df['high'] - df['low'])
+        df['3d_vwap'] = (df['vp'] * (df['high'] + df['low'] + df['close'])).cumsum() / df['vp'].cumsum()
+        return df['3d_vwap'].iloc[-1]
+
+    def calculate_future_vwap(self, symbol):
+        """Predict next period's VWAP"""
+        df = self.get_ohlc_data(symbol, 100)
+        if df is None or df.empty:
+            self.logger.warning(f"No data available for {symbol} future VWAP calculation")
+            return None
+        df['vwap'] = self.calculate_vwap(df)
+        X = np.array(range(len(df))).reshape(-1, 1)
+        y = df['vwap'].values
+        model = LinearRegression().fit(X, y)
+        return model.predict([[len(df)]])[0]
+
+    def get_dynamic_multipliers(self, symbol):
+        """Volatility-adjusted SL/TP"""
+        df = self.get_ohlc_data(symbol, 100)
+        if df is None or df.empty:
+            return 1.0, 1.5
+        atr = self.calculate_atr(df)
+        rel_vol = atr / df['close'].iloc[-1] if df['close'].iloc[-1] != 0 else 0
+
+        if rel_vol > 0.005:
+            return 1.3, 2.0
+        elif rel_vol < 0.002:
+            return 0.8, 1.8
+        return 1.0, 1.5
+
+    def execute_enhanced_trade(self, signal, symbol, price, atr):
+        """Advanced trade execution with all features"""
+        if not self.check_market_open(symbol):
+            self.logger.warning(f"Market not open for {symbol}")
+            return False
+
+        # Get current tick to check spread
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            self.logger.error(f"Could not get tick data for {symbol}")
+            return False
+
+        # Don't trade if spread is too wide
+        spread = tick.ask - tick.bid
+        if spread > atr * 0.1:  # Don't trade if spread > 10% of ATR
+            self.logger.warning(f"Spread too wide ({spread:.5f}) for {symbol}, skipping trade")
+            return False
+
+        sl_mult, tp_mult = self.get_dynamic_multipliers(symbol)
+        lot_size = self.dynamic_position_sizing(symbol, price, atr)
+        if lot_size is None:
+            return False
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": lot_size,
+            "type": self.ORDER_BUY if signal == "BUY" else self.ORDER_SELL,
+            "price": price,
+            "sl": price - (sl_mult * atr) if signal == "BUY" else price + (sl_mult * atr),
+            "tp": price + (tp_mult * atr) if signal == "BUY" else price - (tp_mult * atr),
+            "deviation": self.DEVIATION,
+            "magic": self.MAGIC_NUMBER,
+            "type_filling": mt5.ORDER_FILLING_FOK,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "comment": f"VWAP_{signal}"
+        }
+
+        print(f"\nAttempting {signal} order for {symbol}:")
+        print(f"Price: {price:.5f}")
+        print(f"Lots: {lot_size:.2f}")
+        print(f"SL: {request['sl']:.5f}")
+        print(f"TP: {request['tp']:.5f}")
+
+        for attempt in range(3):
+            result = mt5.order_send(request)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                self.logger.info(f"Trade executed: {symbol} {signal}")
+                self.send_telegram_alert(
+                    f"✅ {signal} {symbol}\n"
+                    f"Entry: {price:.5f}\n"
+                    f"SL: {request['sl']:.5f}\n"
+                    f"TP: {request['tp']:.5f}\n"
+                    f"Lots: {lot_size:.2f}\n"
+                    f"ATR: {atr:.5f}"
+                )
+                return True
+            else:
+                self.logger.warning(f"Trade attempt {attempt + 1} failed: {self.get_error_description(result.retcode)}")
+                print(f"Attempt {attempt + 1} failed: {self.get_error_description(result.retcode)}")
+                time.sleep(1)
+
+        self.logger.error(f"Trade failed after 3 attempts: {self.get_error_description(result.retcode)}")
+        self.send_telegram_alert(
+            f"❌ Failed to execute {signal} on {symbol}\n"
+            f"Error: {self.get_error_description(result.retcode)}"
+        )
+        return False
+
+    def start_dashboard(self):
+        """Launch real-time monitoring dashboard"""
+        self.dash_app = Dash(__name__)
+
+        self.dash_app.layout = html.Div([
+            html.H1("Elite VWAP Trader Dashboard", style={'textAlign': 'center'}),
+            html.Div(id='status-update', style={'padding': '20px', 'fontSize': '18px'}),
+            dcc.Graph(id='price-chart'),
+            dcc.Interval(
+                id='interval-component',
+                interval=10 * 1000,  # in milliseconds
+                n_intervals=0
+            ),
+            html.Div([
+                html.H3("Current Positions"),
+                html.Div(id='positions-table')
+            ], style={'marginTop': '30px'})
+        ])
+
+        @self.dash_app.callback(
+            [Output('status-update', 'children'),
+             Output('price-chart', 'figure'),
+             Output('positions-table', 'children')],
+            [Input('interval-component', 'n_intervals')]
+        )
+        def update_dashboard(n):
+            status = f"Last update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+            # Get price chart for current symbol or first symbol
+            current_symbol = self.current_symbol or self.symbols[0]
+            fig = self.create_price_chart(current_symbol)
+
+            # Get current positions
+            positions = self.get_current_positions()
+
+            return status, fig, positions
+
+        def run_dash():
+            self.dash_app.run(debug=False, use_reloader=False)
+
+        self.dash_thread = threading.Thread(target=run_dash, daemon=True)
+        self.dash_thread.start()
+        self.logger.info("Dashboard started on http://localhost:8050")
+
+    def create_price_chart(self, symbol):
+        """Create a price chart with VWAP for the dashboard"""
+        df = self.get_ohlc_data(symbol, 100)
+        if df is None or df.empty:
+            return go.Figure()
+
+        vwap = self.calculate_vwap(df)
+
+        fig = go.Figure(data=[
+            go.Candlestick(
+                x=df['time'],
+                open=df['open'],
+                high=df['high'],
+                low=df['low'],
+                close=df['close'],
+                name='Price'
+            ),
+            go.Scatter(
+                x=df['time'],
+                y=[vwap] * len(df),
+                name='VWAP',
+                line=dict(color='blue', width=2)
+            )
+        ])
+
+        fig.update_layout(
+            title=f"{symbol} Price with VWAP",
+            xaxis_title="Time",
+            yaxis_title="Price",
+            xaxis_rangeslider_visible=False
+        )
+
+        return fig
+
+    def get_current_positions(self):
+        """Get current positions for dashboard display"""
+        positions = mt5.positions_get()
+        if positions is None or len(positions) == 0:
+            return html.P("No open positions")
+
+        position_rows = []
+        for pos in positions:
+            if pos.magic == self.MAGIC_NUMBER:
+                position_rows.append(html.Tr([
+                    html.Td(pos.symbol),
+                    html.Td("BUY" if pos.type == self.ORDER_BUY else "SELL"),
+                    html.Td(f"{pos.volume:.2f}"),
+                    html.Td(f"{pos.price:.5f}"),
+                    html.Td(f"{pos.sl:.5f}"),
+                    html.Td(f"{pos.tp:.5f}"),
+                    html.Td(f"${pos.profit:.2f}")
+                ]))
+
+        return html.Table([
+            html.Thead(html.Tr([
+                html.Th("Symbol"),
+                html.Th("Type"),
+                html.Th("Volume"),
+                html.Th("Price"),
+                html.Th("SL"),
+                html.Th("TP"),
+                html.Th("Profit")
+            ])),
+            html.Tbody(position_rows)
+        ])
+
+    def analyze_market(self):
+        """Comprehensive market analysis with debugging"""
+        print("\nStarting market analysis...")
+        signals = []
+
+        for symbol in self.symbols:
+            print(f"\nAnalyzing {symbol}...")
+            df = self.get_ohlc_data(symbol, self.vwap_period)
+
+            if df is None or df.empty:
+                print(f"No data for {symbol}")
+                continue
+
+            current_vwap = self.calculate_dynamic_vwap(symbol)
+            future_vwap = self.calculate_future_vwap(symbol)
+
+            if current_vwap is None or future_vwap is None:
+                print(f"Could not calculate VWAP for {symbol}")
+                continue
+
+            print(f"{symbol} Current VWAP: {current_vwap:.5f}")
+            print(f"{symbol} Future VWAP: {future_vwap:.5f}")
+
+            signal = self.generate_signal(df, current_vwap, future_vwap)
+
+            if signal:
+                score = self.calculate_signal_score(symbol, signal)
+                print(f"Signal found for {symbol}: {signal} (Score: {score:.2f})")
+                signals.append({
+                    'symbol': symbol,
+                    'signal': signal,
+                    'score': score,
+                    'timeframe': self.timeframe,
+                    'price': df['close'].iloc[-1],
+                    'atr': self.calculate_atr(df)
+                })
+            else:
+                print(f"No signal for {symbol}")
+
+        if signals:
+            return sorted(signals, key=lambda x: abs(x['score']), reverse=True)
+        else:
+            print("No signals found in any symbols")
+            return []
+
+    def check_market_conditions(self):
+        """Check if market is open and ready for trading"""
+        now = datetime.utcnow()
+        if not (self.trading_hours["start"] <= now.hour < self.trading_hours["end"]):
+            print("Outside trading hours")
+            return False
+
+        if not self.is_good_trading_time():
+            print("Not a good trading time (market open/close)")
+            return False
+
+        if self.current_symbol:
+            rates = mt5.copy_rates_from_pos(self.current_symbol, self.timeframe, 0, 1)
+        else:
+            rates = mt5.copy_rates_from_pos(self.symbols[0], self.timeframe, 0, 1)
+
+        if rates is None:
+            self.logger.warning("Failed to get rates data")
+            return False
+
+        current_bar_time = pd.to_datetime(rates[0]['time'], unit='s')
+        if self.last_trade_time and current_bar_time <= self.last_trade_time:
+            print("Waiting for new bar")
+            return False
+
+        return True
+
+    def calculate_atr(self, df):
+        """Calculate Average True Range"""
+        try:
+            high_low = df['high'] - df['low']
+            high_close = abs(df['high'] - df['close'].shift())
+            low_close = abs(df['low'] - df['close'].shift())
+            true_ranges = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            return true_ranges.rolling(self.atr_period).mean().iloc[-1]
+        except Exception as e:
+            self.logger.error("Error calculating ATR: %s", e)
+            return 0
+
+    def calculate_vwap(self, df):
+        """Calculate Volume Weighted Average Price"""
+        try:
+            df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
+            df['cum_vol_price'] = (df['typical_price'] * df['tick_volume']).cumsum()
+            df['cum_vol'] = df['tick_volume'].cumsum()
+            df['vwap'] = df['cum_vol_price'] / df['cum_vol']
+            return df['vwap'].iloc[-1]
+        except Exception as e:
+            self.logger.error("Error calculating VWAP: %s", e)
+            return 0
+
+    def calculate_position_size(self, current_price, atr):
+        """Adjusted for small accounts with debug output"""
+        try:
+            account = mt5.account_info()
+            if account is None:
+                self.logger.error("No account info available")
+                return None
+
+            # Adjust risk amount for small accounts
+            risk_amount = min(account.balance * (self.risk_percent / 100), account.balance * 0.05)  # Max 5% risk
+
+            # Adjust pip value for micro lots
+            pip_value = 1  # $1 per pip for micro lots
+
+            # Calculate lots
+            lots = risk_amount / (self.stop_loss_multiplier * atr * pip_value)
+
+            symbol_info = mt5.symbol_info(self.current_symbol)
+            if symbol_info is None:
+                self.logger.error(f"No symbol info for {self.current_symbol}")
+                return None
+
+            # Ensure we're using micro lots (0.01)
+            lots = max(lots, 0.01)
+            lots = round(lots / 0.01) * 0.01  # Round to nearest 0.01
+
+            print(f"Calculated Lots: {lots:.2f}")
+            return lots
+
+        except Exception as e:
+            self.logger.error(f"Error in position sizing: {e}")
+            return None
+
+    def close_all_positions(self, symbol=None):
+        """Close positions - optionally for specific symbol"""
+        try:
+            positions = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
+            if positions is None:
+                return True
+
+            if len(positions) == 0:
+                return True
+
+            for position in positions:
+                if position.magic == self.MAGIC_NUMBER:
+                    tick = mt5.symbol_info_tick(position.symbol)
+                    if tick is None:
+                        continue
+
+                    price = tick.bid if position.type == self.ORDER_BUY else tick.ask
+
+                    request = {
+                        "action": self.TRADE_ACTION_DEAL,
+                        "symbol": position.symbol,
+                        "volume": position.volume,
+                        "type": self.ORDER_SELL if position.type == self.ORDER_BUY else self.ORDER_BUY,
+                        "position": position.ticket,
+                        "price": price,
+                        "deviation": self.DEVIATION,
+                        "magic": self.MAGIC_NUMBER,
+                        "comment": "Auto-closed by bot",
+                        "type_time": self.ORDER_TIME_GTC,
+                        "type_filling": mt5.ORDER_FILLING_FOK
+                    }
+
+                    result = mt5.order_send(request)
+                    if result.retcode != mt5.TRADE_RETCODE_DONE:
+                        self.logger.warning("Failed to close position %d, error: %d", position.ticket, result.retcode)
+                    else:
+                        self.send_telegram_alert(f"🔴 Closed {position.symbol} position at {price:.5f}")
+            return True
+        except Exception as e:
+            self.logger.error("Error closing positions: %s", e)
+            return False
+
+    def get_ohlc_data(self, symbol, num_bars=100, timeframe=None):
+        """Get OHLC data for specific symbol"""
+        try:
+            timeframe = timeframe or self.timeframe
+            rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, num_bars)
+            if rates is None:
+                self.logger.warning(f"No rates data for {symbol}")
+                return None
+
+            df = pd.DataFrame(rates)
+            df['time'] = pd.to_datetime(df['time'], unit='s')
+            return df
+        except Exception as e:
+            self.logger.error("Error getting OHLC data for %s: %s", symbol, e)
+            return None
+
+    def get_error_description(self, error_code):
+        """Get human-readable description of MT5 error codes"""
+        error_descriptions = {
+            10019: "No quotes to process the request - check if market is open",
+            10014: "Invalid price in order request",
+            10015: "Invalid stops in order request",
+            10016: "Trade is disabled",
+            10017: "Market is closed",
+            10018: "Insufficient funds",
+            10021: "Order already exists",
+            10027: "Position not found",
+            10030: "Invalid volume in order request",
+            10031: "Invalid order expiration date"
+        }
+        return error_descriptions.get(error_code, f"Unknown error code: {error_code}")
+
+    def check_account_status(self):
+        """Monitor account balance and equity"""
+        try:
+            account = mt5.account_info()
+            if account is None:
+                return False
+
+            print(f"\nAccount Balance: ${account.balance:.2f}")
+            print(f"Account Equity: ${account.equity:.2f}")
+            print(f"Used Margin: ${account.margin:.2f}")
+            print(f"Free Margin: ${account.margin_free:.2f}")
+
+            positions = mt5.positions_get()
+            if positions and len(positions) > 0:
+                margin_level = account.margin_level
+                if margin_level is not None and margin_level < 100:
+                    alert_msg = "⚠️ EMERGENCY: Margin level below 100% - closing all positions!"
+                    print(alert_msg)
+                    self.logger.warning(alert_msg)
+                    self.send_telegram_alert(alert_msg)
+                    self.close_all_positions()
+                    return False
+
+            return True
+        except Exception as e:
+            self.logger.error("Error checking account status: %s", e)
+            return False
+
+    def check_market_open(self, symbol):
+        """Check if market is open for trading"""
+        now = datetime.utcnow()
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            return False
+        return symbol_info.trade_mode == mt5.SYMBOL_TRADE_MODE_FULL
+
+    def is_good_trading_time(self):
+        """Check if current time is good for trading (avoid low liquidity periods)"""
+        now = datetime.utcnow()
+        # Avoid trading in last/first hour of major sessions
+        bad_hours = [
+            (6, 7),  # London open
+            (15, 16),  # London close
+            (7, 8),  # NY open
+            (16, 17),  # NY close
+            (20, 21),  # Asia open
+            (4, 5)  # Asia close
+        ]
+        current_hour = now.hour
+        return not any(start <= current_hour < end for (start, end) in bad_hours)
+
+    def generate_signal(self, df, current_vwap, future_vwap):
+        """Generate trading signal based on VWAP with improved logic"""
+        if df is None or df.empty:
+            self.logger.warning("No data available for signal generation")
+            return None
+
+        current_price = df['close'].iloc[-1]
+        atr = self.calculate_atr(df)
+
+        # Print debug information
+        print(f"\nSignal Generation Debug:")
+        print(f"Current Price: {current_price:.5f}")
+        print(f"Current VWAP: {current_vwap:.5f}")
+        print(f"Future VWAP: {future_vwap:.5f}")
+        print(f"ATR: {atr:.5f}")
+
+        # Calculate percentage deviation from VWAP
+        deviation_pct = (current_price - current_vwap) / current_vwap * 100
+
+        # Calculate trend strength (using simple moving average slope)
+        sma_short = df['close'].rolling(5).mean().iloc[-1]
+        sma_long = df['close'].rolling(20).mean().iloc[-1]
+        trend_strength = (sma_short - sma_long) / atr if atr > 0 else 0
+
+        print(f"Deviation: {deviation_pct:.2f}%")
+        print(f"Trend Strength: {trend_strength:.2f}")
+
+        # Generate BUY signal conditions
+        buy_conditions = (
+                current_price > current_vwap * (1 + self.min_deviation_pct / 100) and  # Price above VWAP
+                current_price < future_vwap * (1 + self.min_deviation_pct / 100) and  # Below predicted VWAP
+                deviation_pct > self.min_deviation_pct and  # Significant deviation
+                trend_strength > self.min_trend_strength and  # Upward trend
+                (current_price - df['low'].iloc[-1]) < (0.3 * atr)  # Not at bottom of recent range
+        )
+
+        # Generate SELL signal conditions
+        sell_conditions = (
+                current_price < current_vwap * (1 - self.min_deviation_pct / 100) and  # Price below VWAP
+                current_price > future_vwap * (1 - self.min_deviation_pct / 100) and  # Above predicted VWAP
+                deviation_pct < -self.min_deviation_pct and  # Significant deviation
+                trend_strength < -self.min_trend_strength and  # Downward trend
+                (df['high'].iloc[-1] - current_price) < (0.3 * atr)  # Not at top of recent range
+        )
+
+        if buy_conditions:
+            print("BUY conditions met")
+            return "BUY"
+        elif sell_conditions:
+            print("SELL conditions met")
+            return "SELL"
+
+        print("No signal conditions met")
+        return None
+
+    def calculate_signal_score(self, symbol, signal):
+        """Calculate more accurate signal strength score"""
+        df = self.get_ohlc_data(symbol, 100)
+        if df is None or df.empty:
+            return 0
+
+        current_price = df['close'].iloc[-1]
+        current_vwap = self.calculate_vwap(df)
+        atr = self.calculate_atr(df)
+
+        if atr == 0:
+            return 0
+
+        # Calculate basic deviation score
+        deviation = abs(current_price - current_vwap) / atr
+
+        # Add volume confirmation (higher volume = stronger signal)
+        volume_avg = df['tick_volume'].rolling(5).mean().iloc[-1]
+        current_volume = df['tick_volume'].iloc[-1]
+        volume_factor = min(2.0, current_volume / volume_avg) if volume_avg > 0 else 1.0
+
+        # Add trend confirmation
+        sma_short = df['close'].rolling(5).mean().iloc[-1]
+        sma_long = df['close'].rolling(20).mean().iloc[-1]
+        trend_factor = abs(sma_short - sma_long) / atr if atr > 0 else 0
+
+        # Combine factors
+        score = deviation * volume_factor * (1 + trend_factor)
+
+        # Adjust direction based on signal type
+        return score if signal == "BUY" else -score
+
+    def dynamic_position_sizing(self, symbol, price, atr):
+        """Calculate dynamic position size"""
+        return self.calculate_position_size(price, atr)
+
+    def ml_confirm_signal(self, symbol, signal):
+        """ML confirmation of signal (placeholder)"""
+        return True  # For now, always confirm
+
+    def filter_correlated_pairs(self, signals):
+        """Filter correlated pairs (placeholder)"""
+        return signals
+
+    def filter_news_events(self, signals):
+        """Filter signals based on news events (placeholder)"""
+        return signals
+
+    def test_trade_execution(self):
+        """Test trade execution with micro lots"""
+        print("\nRunning trade execution test...")
+        for symbol in self.symbols:
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                print(f"Could not get tick data for {symbol}")
+                continue
+
+            print(f"\nTesting {symbol}:")
+            print(f"Ask: {tick.ask:.5f}, Bid: {tick.bid:.5f}")
+
+            # Test BUY
+            print("Testing BUY order...")
+            if self.execute_enhanced_trade("BUY", symbol, tick.ask, 0.001):
+                print("BUY test successful!")
+                time.sleep(5)
+                self.close_all_positions(symbol)
+
+            # Test SELL
+            print("Testing SELL order...")
+            if self.execute_enhanced_trade("SELL", symbol, tick.bid, 0.001):
+                print("SELL test successful!")
+                time.sleep(5)
+                self.close_all_positions(symbol)
+
+    def run(self):
+        """Main trading loop"""
+        if not self.initialize_mt5():
+            print("❌ MT5 initialization failed")
+            return
+
+        # Run trade execution test first
+        self.test_trade_execution()
+
+        self.send_telegram_alert("🚀 Multi-Pair VWAP Trader started")
+        self.start_dashboard()
+
+        try:
+            while True:
+                print("\n🔍 Scanning for best trading opportunity...")
+
+                if not self.check_market_conditions():
+                    print("🔍 Market conditions not met. Waiting...")
+                    time.sleep(60)
+                    continue
+
+                if not self.check_account_status():
+                    print("🔍 Account status check failed. Waiting...")
+                    time.sleep(300)
+                    continue
+
+                print("🔍 Analyzing market conditions...")
+                signals = self.analyze_market()
+                if not signals:
+                    print("🔍 No valid trading opportunities found. Waiting...")
+                    time.sleep(30)
+                    continue
+
+                best = signals[0]
+                print(f"🔍 Identified opportunity: {best['symbol']} "
+                      f"(Score: {best['score']:.2f}, Signal: {best['signal']})")
+
+                if abs(best['score']) > self.score_threshold:
+                    self.current_symbol = best['symbol']
+                    if best['signal'] == self.last_signal:
+                        self.consecutive_signals += 1
+                    else:
+                        self.consecutive_signals = 1
+
+                    self.last_signal = best['signal']
+
+                    if self.consecutive_signals >= self.required_consecutive:
+                        print(f"\n🎯 Strong signal confirmed: {best['symbol']} ({best['signal']})")
+                        self.send_telegram_alert(
+                            f"🎯 Strong signal detected:\n"
+                            f"Symbol: {best['symbol']}\n"
+                            f"Signal: {best['signal']}\n"
+                            f"Score: {best['score']:.2f}"
+                        )
+                        if self.ml_confirm_signal(best['symbol'], best['signal']):
+                            self.execute_enhanced_trade(
+                                best['signal'],
+                                best['symbol'],
+                                best['price'],
+                                best['atr']
+                            )
+
+                time.sleep(30)
+
+        except KeyboardInterrupt:
+            print("\n🛑 Bot stopped by user")
+            self.send_telegram_alert("🛑 Trading bot manually stopped")
+        except Exception as e:
+            error_msg = f"❌ Critical error: {str(e)}"
+            print(error_msg)
+            self.logger.error(error_msg)
+            self.send_telegram_alert(error_msg)
+        finally:
+            mt5.shutdown()
+            print("MT5 connection closed")
+
+
+if __name__ == "__main__":
+    trader = EliteVWAPTrader()
+    trader. Run()
