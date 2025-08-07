@@ -43,8 +43,8 @@ class EliteVWAPTrader:
         self.trading_hours = {"start": 0, "end": 23}
 
         # Telegram notifications
-        self.telegram_bot_token = "8279551043:AAHBHbg9BeTY2bRjUoLje-Q4uxPSVAE3R_0"
-        self.telegram_chat_id = "814231059"
+        self.telegram_bot_token = ""
+        self.telegram_chat_id = ""
 
         # MT5 constants
         self.ORDER_BUY = 0
